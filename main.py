@@ -78,7 +78,7 @@ async def main():
                                 change_24h = float(coin.get("price_change_percentage_24h_in_currency") or 0)
 
                                 if symbol and price > 0 and mcap > 0 and vol > 0:
-                                    if 100000 <= mcap <= 20000000 and vol >= 10000 and change_1h >= 1.0:
+                                    if 50000 <= mcap <= 100000000 and vol >= 5000 and change_1h >= 1.0:
                                         if symbol not in sent_tokens:
                                             label, emoji, target_low, target_high, score = analyze_signal(change_1h, vol, mcap)
 
