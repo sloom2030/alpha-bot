@@ -5,3 +5,4 @@ python-dotenv>=1.0.0
 yfinance>=0.2.30
 pandas>=2.0.0
 pytz
+aiohttp
