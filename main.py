@@ -32,7 +32,15 @@ MAX_PCR_VOLUME = 0.85
 MAX_PCR_OI = 1.00
 MIN_OPTIONS_VOLUME = 500
 
-BINANCE_URL = "https://api.binance.com"
+# data-api.binance.vision = نطاق بيانات السوق الرسمي، غير محجوب على سيرفرات Render
+BINANCE_HOSTS = [
+    "https://data-api.binance.vision",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+    "https://api.binance.com",
+]
+ACTIVE_HOST = None
+
 QUOTE_ASSET = "USDT"
 MAX_PAIRS = 60
 MIN_QUOTE_VOL = 20_000_000.0
@@ -120,137 +128,31 @@ def nasdaq_is_open():
     return 570 <= m <= 960
 
 
-def options_flow(symbol):
-    import yfinance as yf
-    try:
-        t = yf.Ticker(symbol)
-        expiries = list(t.options or [])[:2]
-        if not expiries:
-            return None
-        calls, puts = [], []
-        for e in expiries:
-            ch = t.option_chain(e)
-            calls.append(ch.calls)
-            puts.append(ch.puts)
-        cdf = pd.concat(calls, ignore_index=True)
-        pdf = pd.concat(puts, ignore_index=True)
-    except Exception:
-        return None
-    if cdf.empty or pdf.empty:
-        return None
-    for fr in (cdf, pdf):
-        for col in ("volume", "openInterest", "strike"):
-            if col not in fr.columns:
-                fr[col] = 0
-        fr[["volume", "openInterest", "strike"]] = (
-            fr[["volume", "openInterest", "strike"]].fillna(0).astype(float))
-    cv, pv = float(cdf["volume"].sum()), float(pdf["volume"].sum())
-    coi, poi = float(cdf["openInterest"].sum()), float(pdf["openInterest"].sum())
-    return {
-        "pcr_volume": pv / cv if cv else 99.0,
-        "pcr_oi": poi / coi if coi else 99.0,
-        "resistance": float(cdf.loc[cdf["openInterest"].idxmax(), "strike"]),
-        "support": float(pdf.loc[pdf["openInterest"].idxmax(), "strike"]),
-        "total_volume": cv + pv,
-    }
-
-
-def analyze_nasdaq(symbol):
-    import yfinance as yf
-    try:
-        raw = yf.Ticker(symbol).history(period="6mo", interval="1d", auto_adjust=False)
-    except Exception:
-        return None
-    if raw is None or raw.empty or len(raw) < 60:
-        return None
-    df = raw.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]].dropna()
-
-    close = df["close"]
-    price = float(close.iloc[-1])
-    e20, e50 = ema(close, 20), ema(close, 50)
-    r = float(rsi(close, 14).iloc[-1])
-    a = float(atr(df, 14).iloc[-1])
-    atr_pct = (a / price) * 100 if price else 0.0
-    if atr_pct <= 0:
-        return None
-    avg20 = float(df["volume"].tail(20).mean())
-    vol_ratio = float(df["volume"].iloc[-1]) / avg20 if avg20 else 0.0
-
-    if not (price > float(e20.iloc[-1]) > float(e50.iloc[-1])):
-        return None
-    if not (52 <= r <= 74):
-        return None
-    if vol_ratio < 1.15:
-        return None
-
-    flow = options_flow(symbol)
-    if not flow:
-        return None
-    if flow["total_volume"] < MIN_OPTIONS_VOLUME:
-        return None
-    if flow["pcr_volume"] > MAX_PCR_VOLUME:
-        return None
-    if flow["pcr_oi"] > MAX_PCR_OI:
-        return None
-
-    atr_target = price + 2.2 * a
-    res = flow["resistance"]
-    target = min(res, atr_target * 1.15) if res > price * 1.03 else atr_target
-    target_pct = (target / price - 1) * 100
-    if target_pct < MIN_TARGET_PCT:
-        return None
-    target_pct = clamp(target_pct, MIN_TARGET_PCT, MAX_TARGET_PCT)
-    target = price * (1 + target_pct / 100)
-
-    sup = flow["support"]
-    atr_stop = price - STOP_ATR_MULT * a
-    stop = max(atr_stop, sup * 0.995) if sup < price else atr_stop
-    stop_pct = (1 - stop / price) * 100
-    if stop_pct > MAX_STOP_PCT or stop_pct <= 0:
-        stop = price * (1 - min(MAX_STOP_PCT, max(1.0, atr_pct)) / 100)
-        stop_pct = (1 - stop / price) * 100
-
-    rr = target_pct / stop_pct if stop_pct else 0.0
-    if rr < MIN_RR:
-        return None
-
-    score = 45.0
-    score += clamp((0.85 - flow["pcr_volume"]) * 45, 0, 20)
-    score += clamp((1.00 - flow["pcr_oi"]) * 25, 0, 12)
-    score += clamp((vol_ratio - 1.0) * 18, 0, 12)
-    score += clamp((r - 50) * 0.5, 0, 8)
-    score += clamp((rr - 1.5) * 6, 0, 8)
-    score = round(clamp(score, 0, 99), 1)
-    if score < MIN_SCORE:
-        return None
-
-    sentiment = (f"تدفق خيارات صاعد — نسبة البيع/الشراء (الحجم) {flow['pcr_volume']:.2f} "
-                 f"والمراكز المفتوحة {flow['pcr_oi']:.2f} | "
-                 f"حجم عقود {int(flow['total_volume']):,} | "
-                 f"مقاومة {flow['resistance']:.2f} ودعم {flow['support']:.2f} | "
-                 f"حجم التداول {vol_ratio:.2f}x المتوسط")
-
-    return Signal(symbol, "Nasdaq", price, target, stop, target_pct, stop_pct, rr,
-                  timeframe_of(target_pct, atr_pct, 6.5), sentiment, score)
-
-
-def scan_nasdaq():
-    out = []
-    for sym in NASDAQ_SYMBOLS:
-        try:
-            s = analyze_nasdaq(sym)
-            if s:
-                out.append(s)
-        except Exception:
-            pass
-    return out
-
-
+# =============================================================
+#  باينانس - سبوت فقط مع تجاوز الحجب الجغرافي (خطأ 451)
+# =============================================================
 async def bget(session, path, **params):
-    url = f"{BINANCE_URL}/api/v3/{path}"
-    async with session.get(url, params=params or None, timeout=20) as r:
-        r.raise_for_status()
-        return await r.json()
+    global ACTIVE_HOST
+    hosts = ([ACTIVE_HOST] + [h for h in BINANCE_HOSTS if h != ACTIVE_HOST]) \
+        if ACTIVE_HOST else list(BINANCE_HOSTS)
+    last_err = None
+    for host in hosts:
+        try:
+            url = f"{host}/api/v3/{path}"
+            async with session.get(url, params=params or None, timeout=20) as r:
+                if r.status in (401, 403, 451):
+                    last_err = Exception(f"{host} blocked ({r.status})")
+                    continue
+                r.raise_for_status()
+                data = await r.json()
+                if ACTIVE_HOST != host:
+                    ACTIVE_HOST = host
+                    log.info(f"Binance host: {host}")
+                return data
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err if last_err else Exception("all binance hosts failed")
 
 
 async def spot_universe(session):
@@ -383,6 +285,138 @@ async def scan_crypto(session):
     return [s for s in res if s]
 
 
+# =============================================================
+#  ناسداك - تحليل تدفق عقود الخيارات
+# =============================================================
+def options_flow(symbol):
+    import yfinance as yf
+    try:
+        t = yf.Ticker(symbol)
+        expiries = list(t.options or [])[:2]
+        if not expiries:
+            return None
+        calls, puts = [], []
+        for e in expiries:
+            ch = t.option_chain(e)
+            calls.append(ch.calls)
+            puts.append(ch.puts)
+        cdf = pd.concat(calls, ignore_index=True)
+        pdf = pd.concat(puts, ignore_index=True)
+    except Exception:
+        return None
+    if cdf.empty or pdf.empty:
+        return None
+    for fr in (cdf, pdf):
+        for col in ("volume", "openInterest", "strike"):
+            if col not in fr.columns:
+                fr[col] = 0
+        fr[["volume", "openInterest", "strike"]] = (
+            fr[["volume", "openInterest", "strike"]].fillna(0).astype(float))
+    cv, pv = float(cdf["volume"].sum()), float(pdf["volume"].sum())
+    coi, poi = float(cdf["openInterest"].sum()), float(pdf["openInterest"].sum())
+    return {
+        "pcr_volume": pv / cv if cv else 99.0,
+        "pcr_oi": poi / coi if coi else 99.0,
+        "resistance": float(cdf.loc[cdf["openInterest"].idxmax(), "strike"]),
+        "support": float(pdf.loc[pdf["openInterest"].idxmax(), "strike"]),
+        "total_volume": cv + pv,
+    }
+
+
+def analyze_nasdaq(symbol):
+    import yfinance as yf
+    try:
+        raw = yf.Ticker(symbol).history(period="6mo", interval="1d", auto_adjust=False)
+    except Exception:
+        return None
+    if raw is None or raw.empty or len(raw) < 60:
+        return None
+    df = raw.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]].dropna()
+
+    close = df["close"]
+    price = float(close.iloc[-1])
+    e20, e50 = ema(close, 20), ema(close, 50)
+    r = float(rsi(close, 14).iloc[-1])
+    a = float(atr(df, 14).iloc[-1])
+    atr_pct = (a / price) * 100 if price else 0.0
+    if atr_pct <= 0:
+        return None
+    avg20 = float(df["volume"].tail(20).mean())
+    vol_ratio = float(df["volume"].iloc[-1]) / avg20 if avg20 else 0.0
+
+    if not (price > float(e20.iloc[-1]) > float(e50.iloc[-1])):
+        return None
+    if not (52 <= r <= 74):
+        return None
+    if vol_ratio < 1.15:
+        return None
+
+    flow = options_flow(symbol)
+    if not flow:
+        return None
+    if flow["total_volume"] < MIN_OPTIONS_VOLUME:
+        return None
+    if flow["pcr_volume"] > MAX_PCR_VOLUME:
+        return None
+    if flow["pcr_oi"] > MAX_PCR_OI:
+        return None
+
+    atr_target = price + 2.2 * a
+    res = flow["resistance"]
+    target = min(res, atr_target * 1.15) if res > price * 1.03 else atr_target
+    target_pct = (target / price - 1) * 100
+    if target_pct < MIN_TARGET_PCT:
+        return None
+    target_pct = clamp(target_pct, MIN_TARGET_PCT, MAX_TARGET_PCT)
+    target = price * (1 + target_pct / 100)
+
+    sup = flow["support"]
+    atr_stop = price - STOP_ATR_MULT * a
+    stop = max(atr_stop, sup * 0.995) if sup < price else atr_stop
+    stop_pct = (1 - stop / price) * 100
+    if stop_pct > MAX_STOP_PCT or stop_pct <= 0:
+        stop = price * (1 - min(MAX_STOP_PCT, max(1.0, atr_pct)) / 100)
+        stop_pct = (1 - stop / price) * 100
+
+    rr = target_pct / stop_pct if stop_pct else 0.0
+    if rr < MIN_RR:
+        return None
+
+    score = 45.0
+    score += clamp((0.85 - flow["pcr_volume"]) * 45, 0, 20)
+    score += clamp((1.00 - flow["pcr_oi"]) * 25, 0, 12)
+    score += clamp((vol_ratio - 1.0) * 18, 0, 12)
+    score += clamp((r - 50) * 0.5, 0, 8)
+    score += clamp((rr - 1.5) * 6, 0, 8)
+    score = round(clamp(score, 0, 99), 1)
+    if score < MIN_SCORE:
+        return None
+
+    sentiment = (f"تدفق خيارات صاعد — نسبة البيع/الشراء (الحجم) {flow['pcr_volume']:.2f} "
+                 f"والمراكز المفتوحة {flow['pcr_oi']:.2f} | "
+                 f"حجم عقود {int(flow['total_volume']):,} | "
+                 f"مقاومة {flow['resistance']:.2f} ودعم {flow['support']:.2f} | "
+                 f"حجم التداول {vol_ratio:.2f}x المتوسط")
+
+    return Signal(symbol, "Nasdaq", price, target, stop, target_pct, stop_pct, rr,
+                  timeframe_of(target_pct, atr_pct, 6.5), sentiment, score)
+
+
+def scan_nasdaq():
+    out = []
+    for sym in NASDAQ_SYMBOLS:
+        try:
+            s = analyze_nasdaq(sym)
+            if s:
+                out.append(s)
+        except Exception:
+            pass
+    return out
+
+
+# =============================================================
+#  الرسالة
+# =============================================================
 def build_message(sig):
     f = sig.fmt
     text = ("🚨 **تنبيه إشارة تداول جديدة** 🚨\n\n"
@@ -406,7 +440,8 @@ async def health_server():
         app = web.Application()
 
         async def ok(_):
-            return web.json_response({"status": "ok", "signals": LAST_SIGNALS})
+            return web.json_response({"status": "ok", "host": ACTIVE_HOST,
+                                      "signals": LAST_SIGNALS})
 
         app.router.add_get("/", ok)
         app.router.add_get("/healthz", ok)
