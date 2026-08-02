@@ -54,6 +54,7 @@ NASDAQ_SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO
 ACCURACY = "90% (9/10)"
 LAST_SIGNALS = []
 REJECTS = {}
+SAMPLES = []
 
 
 def reject(reason):
@@ -209,8 +210,10 @@ async def spot_universe(session):
 
 async def analyze_crypto(session, symbol):
     rows = await bget(session, "klines", symbol=symbol, interval="1h", limit=200)
-    if not rows or len(rows) < 60:
-        return None
+    if not isinstance(rows, list):
+        return reject(f"bad_klines_type:{type(rows).__name__}")
+    if len(rows) < 60:
+        return reject(f"short_klines:{len(rows)}")
     df = pd.DataFrame(rows, columns=[
         "open_time", "open", "high", "low", "close", "volume", "close_time",
         "quote_volume", "trades", "taker_base", "taker_quote", "ignore"])
@@ -233,28 +236,34 @@ async def analyze_crypto(session, symbol):
     tq, totq = float(rec["taker_quote"].sum()), float(rec["quote_volume"].sum())
     buy_p = tq / totq if totq else 0.0
 
+    if len(SAMPLES) < 3:
+        SAMPLES.append(f"{symbol} price={price:.6g} rsi={r:.1f} "
+                       f"vol={vol_ratio:.2f}x buy={buy_p * 100:.0f}% "
+                       f"trend={'up' if price > float(e20.iloc[-1]) > float(e50.iloc[-1]) else 'no'} "
+                       f"atr={atr_pct:.2f}%")
+
     if not (price > float(e20.iloc[-1]) > float(e50.iloc[-1])):
-        return None
+        return reject("trend")
     if not (52 <= r <= 74):
-        return None
+        return reject("rsi")
     if vol_ratio < 1.20:
-        return None
+        return reject("volume")
     if buy_p < 0.52:
-        return None
+        return reject("buy_pressure")
 
     book = await bget(session, "depth", symbol=symbol, limit=100)
     bids = sum(float(p) * float(q) for p, q in book.get("bids", []))
     asks = sum(float(p) * float(q) for p, q in book.get("asks", []))
     depth = bids / asks if asks else 0.0
     if depth < 1.0:
-        return None
+        return reject("depth")
 
     swing_high = float(df["high"].tail(48).max())
     atr_target = price + 2.2 * a
     target = max(atr_target, swing_high * 1.005) if swing_high > price else atr_target
     target_pct = (target / price - 1) * 100
     if target_pct < MIN_TARGET_PCT:
-        return None
+        return reject("target<3%")
     target_pct = clamp(target_pct, MIN_TARGET_PCT, MAX_TARGET_PCT)
     target = price * (1 + target_pct / 100)
 
@@ -267,7 +276,7 @@ async def analyze_crypto(session, symbol):
 
     rr = target_pct / stop_pct if stop_pct else 0.0
     if rr < MIN_RR:
-        return None
+        return reject("risk_reward")
 
     score = 42.0
     score += clamp((buy_p - 0.50) * 160, 0, 20)
@@ -277,7 +286,7 @@ async def analyze_crypto(session, symbol):
     score += clamp((rr - 1.5) * 6, 0, 8)
     score = round(clamp(score, 0, 99), 1)
     if score < MIN_SCORE:
-        return None
+        return reject(f"score<{MIN_SCORE:.0f}")
 
     sentiment = (f"سيولة سبوت إيجابية — ضغط شراء {buy_p * 100:.1f}% | "
                  f"عمق السوق (طلب/عرض) {depth:.2f} | "
@@ -296,15 +305,30 @@ async def scan_crypto(session):
         return []
     log.info(f"Binance spot pairs: {len(universe)}")
     sem = asyncio.Semaphore(5)
+    errors = []
 
     async def worker(sym):
         async with sem:
             try:
                 return await analyze_crypto(session, sym)
-            except Exception:
+            except Exception as e:
+                if len(errors) < 3:
+                    errors.append(f"{sym}: {type(e).__name__}: {e}")
+                reject("exception")
                 return None
 
+    REJECTS.clear()
+    SAMPLES.clear()
     res = await asyncio.gather(*(worker(s) for s in universe))
+
+    for s in SAMPLES:
+        log.info(f"sample {s}")
+    for e in errors:
+        log.error(f"error {e}")
+    if REJECTS:
+        breakdown = " | ".join(f"{k}:{v}" for k, v in
+                               sorted(REJECTS.items(), key=lambda x: -x[1]))
+        log.info(f"Rejected -> {breakdown}")
     return [s for s in res if s]
 
 
@@ -465,71 +489,3 @@ async def health_server():
         async def ok(_):
             return web.json_response({"status": "ok", "host": ACTIVE_HOST,
                                       "signals": LAST_SIGNALS})
-
-        app.router.add_get("/", ok)
-        app.router.add_get("/healthz", ok)
-        app.router.add_get("/signals", ok)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
-    except Exception as e:
-        log.warning(f"health server off: {e}")
-
-
-async def main():
-    bot = Bot(token=BOT_TOKEN)
-    log.info("Bot started")
-    await health_server()
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                log.info("Scanning Binance Spot + Nasdaq Options")
-                found = []
-
-                found += await scan_crypto(session)
-                if nasdaq_is_open():
-                    found += await asyncio.to_thread(scan_nasdaq)
-
-                found.sort(key=lambda s: s.score, reverse=True)
-                now = datetime.now(timezone.utc)
-                fresh = []
-                for s in found:
-                    last = sent_tokens.get(s.key)
-                    if last and now - last < timedelta(hours=COOLDOWN_HOURS):
-                        continue
-                    fresh.append(s)
-                    if len(fresh) >= MAX_SIGNALS:
-                        break
-
-                for sig in fresh:
-                    try:
-                        await bot.send_message(
-                            chat_id=CHANNEL_ID,
-                            text=build_message(sig),
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                        )
-                        sent_tokens[sig.key] = datetime.now(timezone.utc)
-                        log.info(f"Signal sent: {sig.key} +{sig.target_pct:.2f}%")
-                        await asyncio.sleep(1)
-                    except Exception as e:
-                        log.error(f"send failed {sig.key}: {e}")
-
-                LAST_SIGNALS.clear()
-                LAST_SIGNALS.extend([{
-                    "symbol": s.symbol, "market": s.market, "entry": round(s.entry, 8),
-                    "target": round(s.target, 8), "stop": round(s.stop, 8),
-                    "target_pct": round(s.target_pct, 2), "timeframe": s.timeframe,
-                    "score": s.score, "accuracy": ACCURACY,
-                } for s in fresh])
-
-                log.info(f"Scan complete: {len(found)} found, {len(fresh)} sent - waiting {SCAN_MINUTES} min")
-                await asyncio.sleep(SCAN_MINUTES * 60)
-
-            except Exception as e:
-                log.error(f"Error: {str(e)}")
-                await asyncio.sleep(60)
-
-
-asyncio.run(main())
