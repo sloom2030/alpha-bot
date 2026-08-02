@@ -489,3 +489,71 @@ async def health_server():
         async def ok(_):
             return web.json_response({"status": "ok", "host": ACTIVE_HOST,
                                       "signals": LAST_SIGNALS})
+
+        app.router.add_get("/", ok)
+        app.router.add_get("/healthz", ok)
+        app.router.add_get("/signals", ok)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
+    except Exception as e:
+        log.warning(f"health server off: {e}")
+
+
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+    log.info("Bot started")
+    await health_server()
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                log.info("Scanning Binance Spot + Nasdaq Options")
+                found = []
+
+                found += await scan_crypto(session)
+                if nasdaq_is_open():
+                    found += await asyncio.to_thread(scan_nasdaq)
+
+                found.sort(key=lambda s: s.score, reverse=True)
+                now = datetime.now(timezone.utc)
+                fresh = []
+                for s in found:
+                    last = sent_tokens.get(s.key)
+                    if last and now - last < timedelta(hours=COOLDOWN_HOURS):
+                        continue
+                    fresh.append(s)
+                    if len(fresh) >= MAX_SIGNALS:
+                        break
+
+                for sig in fresh:
+                    try:
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=build_message(sig),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                        sent_tokens[sig.key] = datetime.now(timezone.utc)
+                        log.info(f"Signal sent: {sig.key} +{sig.target_pct:.2f}%")
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        log.error(f"send failed {sig.key}: {e}")
+
+                LAST_SIGNALS.clear()
+                LAST_SIGNALS.extend([{
+                    "symbol": s.symbol, "market": s.market, "entry": round(s.entry, 8),
+                    "target": round(s.target, 8), "stop": round(s.stop, 8),
+                    "target_pct": round(s.target_pct, 2), "timeframe": s.timeframe,
+                    "score": s.score, "accuracy": ACCURACY,
+                } for s in fresh])
+
+                log.info(f"Scan complete: {len(found)} found, {len(fresh)} sent - waiting {SCAN_MINUTES} min")
+                await asyncio.sleep(SCAN_MINUTES * 60)
+
+            except Exception as e:
+                log.error(f"Error: {str(e)}")
+                await asyncio.sleep(60)
+
+
+asyncio.run(main())
