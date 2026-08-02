@@ -230,9 +230,13 @@ async def analyze_crypto(session, symbol):
     if atr_pct <= 0:
         return None
 
-    avg = float(df["quote_volume"].tail(24).mean())
-    vol_ratio = float(df["quote_volume"].iloc[-1]) / avg if avg else 0.0
-    rec = df.tail(12)
+    # الشمعة الأخيرة غير مكتملة -> نستبعدها من حسابات الحجم
+    closed = df.iloc[:-1]
+    avg = float(closed["quote_volume"].tail(24).mean())
+    last_closed_vol = float(closed["quote_volume"].iloc[-1])
+    vol_ratio = last_closed_vol / avg if avg else 0.0
+
+    rec = closed.tail(12)
     tq, totq = float(rec["taker_quote"].sum()), float(rec["quote_volume"].sum())
     buy_p = tq / totq if totq else 0.0
 
@@ -388,8 +392,8 @@ def analyze_nasdaq(symbol):
     atr_pct = (a / price) * 100 if price else 0.0
     if atr_pct <= 0:
         return None
-    avg20 = float(df["volume"].tail(20).mean())
-    vol_ratio = float(df["volume"].iloc[-1]) / avg20 if avg20 else 0.0
+    avg20 = float(df["volume"].iloc[:-1].tail(20).mean())
+    vol_ratio = float(df["volume"].iloc[-2]) / avg20 if avg20 and len(df) > 21 else 0.0
 
     if not (price > float(e20.iloc[-1]) > float(e50.iloc[-1])):
         return None
