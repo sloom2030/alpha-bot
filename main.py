@@ -42,8 +42,8 @@ BINANCE_HOSTS = [
 ACTIVE_HOST = None
 
 QUOTE_ASSET = "USDT"
-MAX_PAIRS = 60
-MIN_QUOTE_VOL = 20_000_000.0
+MAX_PAIRS = 120
+MIN_QUOTE_VOL = 5_000_000.0
 BLACKLIST = {"USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT"}
 LEVERAGED = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "3LUSDT", "3SUSDT")
 
@@ -53,6 +53,12 @@ NASDAQ_SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO
 
 ACCURACY = "90% (9/10)"
 LAST_SIGNALS = []
+REJECTS = {}
+
+
+def reject(reason):
+    REJECTS[reason] = REJECTS.get(reason, 0) + 1
+    return None
 
 
 @dataclass
@@ -157,20 +163,32 @@ async def bget(session, path, **params):
 
 async def spot_universe(session):
     info = await bget(session, "exchangeInfo")
+    symbols = info.get("symbols", [])
     allowed = set()
-    for s in info.get("symbols", []):
+    n_trading = n_spot = n_quote = 0
+
+    for s in symbols:
         name = s.get("symbol", "")
-        perms = set(s.get("permissions", []))
-        for g in s.get("permissionSets", []) or []:
-            perms.update(g)
+
         if s.get("status") != "TRADING":
             continue
-        if not s.get("isSpotTradingAllowed", False):
+        n_trading += 1
+
+        # السبوت: نعتمد على العلم الرسمي، ونستخدم permissions كتأكيد فقط إن وُجدت
+        perms = set(s.get("permissions") or [])
+        for g in s.get("permissionSets") or []:
+            if isinstance(g, (list, tuple, set)):
+                perms.update(g)
+        spot_flag = s.get("isSpotTradingAllowed")
+        is_spot = spot_flag if spot_flag is not None else ("SPOT" in perms)
+        if not is_spot:
             continue
-        if "SPOT" not in perms:
-            continue
+        n_spot += 1
+
         if s.get("quoteAsset") != QUOTE_ASSET:
             continue
+        n_quote += 1
+
         if name in BLACKLIST:
             continue
         if name.endswith(LEVERAGED):
@@ -181,6 +199,11 @@ async def spot_universe(session):
     ranked = [t for t in tickers if t.get("symbol") in allowed
               and float(t.get("quoteVolume", 0)) >= MIN_QUOTE_VOL]
     ranked.sort(key=lambda t: float(t.get("quoteVolume", 0)), reverse=True)
+
+    log.info(f"exchangeInfo: {len(symbols)} total | {n_trading} trading | "
+             f"{n_spot} spot | {n_quote} {QUOTE_ASSET} | {len(allowed)} allowed | "
+             f"{len(ranked)} above {MIN_QUOTE_VOL:,.0f}$ volume")
+
     return [t["symbol"] for t in ranked[:MAX_PAIRS]]
 
 
