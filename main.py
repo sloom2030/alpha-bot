@@ -18,15 +18,19 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("AlphaBot")
 sent_tokens = {}
 
-SCAN_MINUTES = 30
-COOLDOWN_HOURS = 8
+SCAN_MINUTES = 15
+COOLDOWN_HOURS = 4
 MAX_SIGNALS = 5
-MIN_TARGET_PCT = 3.0
-MAX_TARGET_PCT = 12.0
-MIN_SCORE = 65.0
-MIN_RR = 1.5
-STOP_ATR_MULT = 1.5
-MAX_STOP_PCT = 4.0
+
+# --- وضع الصفقات الصغيرة عالية الدقة ---
+MIN_TARGET_PCT = 1.5      # هدف صغير = احتمال إصابة أعلى
+MAX_TARGET_PCT = 4.0
+TARGET_ATR_MULT = 1.2     # الهدف = 1.2 × التذبذب (قريب وواقعي)
+MAX_TARGET_VS_ATR = 2.5   # الهدف يجب ألا يتجاوز 2.5 ضعف تذبذب الساعة
+MIN_SCORE = 72.0          # عتبة جودة أعلى
+MIN_RR = 1.2
+STOP_ATR_MULT = 1.0
+MAX_STOP_PCT = 1.8
 
 MAX_PCR_VOLUME = 0.85
 MAX_PCR_OI = 1.00
@@ -42,8 +46,8 @@ BINANCE_HOSTS = [
 ACTIVE_HOST = None
 
 QUOTE_ASSET = "USDT"
-MAX_PAIRS = 120
-MIN_QUOTE_VOL = 5_000_000.0
+MAX_PAIRS = 250            # كان 120
+MIN_QUOTE_VOL = 1_000_000.0  # كان 5 ملايين -> يشمل العملات الصغيرة
 BLACKLIST = {"USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT"}
 LEVERAGED = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "3LUSDT", "3SUSDT")
 
@@ -248,26 +252,38 @@ async def analyze_crypto(session, symbol):
 
     if not (price > float(e20.iloc[-1]) > float(e50.iloc[-1])):
         return reject("trend")
-    if not (52 <= r <= 74):
+    if not (55 <= r <= 70):
         return reject("rsi")
-    if vol_ratio < 1.20:
+    if vol_ratio < 1.30:
         return reject("volume")
-    if buy_p < 0.52:
+    if buy_p < 0.55:
         return reject("buy_pressure")
 
     book = await bget(session, "depth", symbol=symbol, limit=100)
-    bids = sum(float(p) * float(q) for p, q in book.get("bids", []))
-    asks = sum(float(p) * float(q) for p, q in book.get("asks", []))
+    bid_list, ask_list = book.get("bids", []), book.get("asks", [])
+    if not bid_list or not ask_list:
+        return reject("no_book")
+    bids = sum(float(p) * float(q) for p, q in bid_list)
+    asks = sum(float(p) * float(q) for p, q in ask_list)
     depth = bids / asks if asks else 0.0
-    if depth < 1.0:
+    if depth < 1.15:
         return reject("depth")
 
+    # حماية العملات الصغيرة: فرق السعر الواسع يلتهم الربح
+    best_bid, best_ask = float(bid_list[0][0]), float(ask_list[0][0])
+    spread_pct = (best_ask - best_bid) / best_bid * 100 if best_bid else 99
+    if spread_pct > 0.15:
+        return reject("spread")
+
     swing_high = float(df["high"].tail(48).max())
-    atr_target = price + 2.2 * a
-    target = max(atr_target, swing_high * 1.005) if swing_high > price else atr_target
+    atr_target = price + TARGET_ATR_MULT * a
+    # الأقرب بين إسقاط التذبذب وقمة السوينغ = أعلى احتمال إصابة
+    target = min(atr_target, swing_high * 1.002) if swing_high > price * 1.005 else atr_target
     target_pct = (target / price - 1) * 100
     if target_pct < MIN_TARGET_PCT:
-        return reject("target<3%")
+        target_pct = MIN_TARGET_PCT
+    if target_pct > MAX_TARGET_VS_ATR * atr_pct:
+        return reject("target_too_far")
     target_pct = clamp(target_pct, MIN_TARGET_PCT, MAX_TARGET_PCT)
     target = price * (1 + target_pct / 100)
 
@@ -308,7 +324,7 @@ async def scan_crypto(session):
         log.error(f"spot universe: {e}")
         return []
     log.info(f"Binance spot pairs: {len(universe)}")
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(10)
     errors = []
 
     async def worker(sym):
@@ -412,11 +428,14 @@ def analyze_nasdaq(symbol):
     if flow["pcr_oi"] > MAX_PCR_OI:
         return None
 
-    atr_target = price + 2.2 * a
+    atr_target = price + TARGET_ATR_MULT * a
     res = flow["resistance"]
-    target = min(res, atr_target * 1.15) if res > price * 1.03 else atr_target
+    # الهدف الأقرب: جدار الكول إن كان قبل إسقاط التذبذب
+    target = min(res, atr_target) if res > price * 1.005 else atr_target
     target_pct = (target / price - 1) * 100
     if target_pct < MIN_TARGET_PCT:
+        target_pct = MIN_TARGET_PCT
+    if target_pct > MAX_TARGET_VS_ATR * atr_pct:
         return None
     target_pct = clamp(target_pct, MIN_TARGET_PCT, MAX_TARGET_PCT)
     target = price * (1 + target_pct / 100)
@@ -474,7 +493,7 @@ def build_message(sig):
             f"• **الأصل / الرمز:** {sig.symbol} ({sig.market})\n"
             f"• **سعر الدخول:** {f(sig.entry)}\n"
             f"• **تحليل عقود الخيارات / السيولة:** {sig.sentiment}\n"
-            f"• **الهدف السعري (+3%+):** {f(sig.target)} (+{sig.target_pct:.2f}%)\n"
+            f"• **الهدف السعري:** {f(sig.target)} (+{sig.target_pct:.2f}%)\n"
             f"• **المدى الزمني المتوقع:** {sig.timeframe}\n"
             f"• **وقف الخسارة:** {f(sig.stop)} (-{sig.stop_pct:.2f}%)\n"
             f"• **معدل دقة الإشارة:** {ACCURACY}\n\n"
