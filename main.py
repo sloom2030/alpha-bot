@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import html
+import json
 import logging
 import os
 import re
@@ -55,10 +56,165 @@ NASDAQ_SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO
                   "AMD", "NFLX", "COST", "PEP", "ADBE", "QCOM", "INTC", "MU",
                   "PLTR", "MRVL", "SMCI", "ARM", "CRWD", "PANW", "LRCX", "ASML"]
 
-ACCURACY = "90% (9/10)"
+ACCURACY = "10%"
 LAST_SIGNALS = []
 REJECTS = {}
 SAMPLES = []
+
+# ===================== تتبع نتائج الإشارات =====================
+TRACK_FILE = os.getenv("TRACK_FILE", "signals_track.json")
+TRACK = {"open": [], "closed": [], "last_report": None}
+REPORT_DAYS = 7
+EXPIRE_HOURS = 48
+
+
+def track_load():
+    try:
+        with open(TRACK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        TRACK["open"] = data.get("open", [])
+        TRACK["closed"] = data.get("closed", [])
+        TRACK["last_report"] = data.get("last_report")
+        log.info(f"Track loaded: {len(TRACK['open'])} open, {len(TRACK['closed'])} closed")
+    except Exception:
+        log.info("Track: starting fresh")
+
+
+def track_save():
+    try:
+        with open(TRACK_FILE, "w", encoding="utf-8") as f:
+            json.dump(TRACK, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"track save failed: {e}")
+
+
+def track_add(sig):
+    TRACK["open"].append({
+        "symbol": sig.symbol,
+        "market": sig.market,
+        "entry": sig.entry,
+        "target": sig.target,
+        "stop": sig.stop,
+        "target_pct": round(sig.target_pct, 2),
+        "stop_pct": round(sig.stop_pct, 2),
+        "score": sig.score,
+        "timeframe": sig.timeframe,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    })
+    track_save()
+
+
+def _close(trade, result, hours):
+    trade["result"] = result          # win | loss | expired
+    trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+    trade["hours_to_close"] = round(hours, 2)
+    TRACK["closed"].append(trade)
+    log.info(f"Track {result.upper()}: {trade['market']}:{trade['symbol']} "
+             f"after {hours:.1f}h")
+
+
+async def _candles_since(session, trade, opened):
+    """شموع 5 دقائق للعملات، وساعة للأسهم، منذ لحظة الإشارة."""
+    if trade["market"] == "Binance Spot":
+        rows = await bget(session, "klines", symbol=trade["symbol"],
+                          interval="5m", limit=576)
+        start_ms = int(opened.timestamp() * 1000)
+        return [(float(r[2]), float(r[3])) for r in rows if int(r[0]) >= start_ms]
+
+    import yfinance as yf
+    raw = await asyncio.to_thread(
+        lambda: yf.Ticker(trade["symbol"]).history(period="5d", interval="1h"))
+    if raw is None or raw.empty:
+        return []
+    raw = raw.rename(columns=str.lower)
+    raw = raw[raw.index >= opened.astimezone(raw.index.tz)]
+    return list(zip(raw["high"].astype(float), raw["low"].astype(float)))
+
+
+async def track_check(session):
+    """يفحص كل إشارة مفتوحة: هل بلغت الهدف أم وقف الخسارة؟"""
+    if not TRACK["open"]:
+        return
+    now = datetime.now(timezone.utc)
+    still_open = []
+
+    for trade in TRACK["open"]:
+        try:
+            opened = datetime.fromisoformat(trade["opened_at"])
+            hours = (now - opened).total_seconds() / 3600
+            candles = await _candles_since(session, trade, opened)
+
+            outcome = None
+            for high, low in candles:
+                # إن ضربت الاثنتين في نفس الشمعة نحتسبها خسارة (الأكثر تحفظاً)
+                if low <= trade["stop"]:
+                    outcome = "loss"
+                    break
+                if high >= trade["target"]:
+                    outcome = "win"
+                    break
+
+            if outcome:
+                _close(trade, outcome, hours)
+            elif hours >= EXPIRE_HOURS:
+                _close(trade, "expired", hours)
+            else:
+                still_open.append(trade)
+        except Exception as e:
+            log.debug(f"track check {trade['symbol']}: {e}")
+            still_open.append(trade)
+
+    TRACK["open"] = still_open
+    track_save()
+
+
+def weekly_report_text():
+    cutoff = datetime.now(timezone.utc) - timedelta(days=REPORT_DAYS)
+    recent = [t for t in TRACK["closed"]
+              if datetime.fromisoformat(t["closed_at"]) >= cutoff]
+    if not recent:
+        return ("📊 **التقرير الأسبوعي**\n\n"
+                "لم تُغلق أي إشارة خلال الأسبوع الماضي.")
+
+    wins = [t for t in recent if t["result"] == "win"]
+    losses = [t for t in recent if t["result"] == "loss"]
+    expired = [t for t in recent if t["result"] == "expired"]
+    decided = len(wins) + len(losses)
+    rate = (len(wins) / decided * 100) if decided else 0.0
+
+    gain = sum(t["target_pct"] for t in wins)
+    loss_sum = sum(t["stop_pct"] for t in losses)
+    net = gain - loss_sum
+    avg_h = sum(t["hours_to_close"] for t in wins) / len(wins) if wins else 0
+
+    lines = [
+        "📊 **التقرير الأسبوعي للإشارات**", "",
+        f"• إجمالي الإشارات المغلقة: {len(recent)}",
+        f"• بلغت الهدف ✅: {len(wins)}",
+        f"• ضربت وقف الخسارة ❌: {len(losses)}",
+        f"• انتهت مدتها بلا نتيجة ⏳: {len(expired)}",
+        "",
+        f"• **نسبة الدقة الفعلية: {rate:.1f}%** ({len(wins)}/{decided})",
+        f"• متوسط زمن بلوغ الهدف: {avg_h:.1f} ساعة",
+        f"• صافي الحركة النظرية: {net:+.2f}%",
+        "",
+        "_النسبة محسوبة من نتائج فعلية وليست رقماً ثابتاً._",
+    ]
+
+    best = sorted(wins, key=lambda t: t["target_pct"], reverse=True)[:3]
+    if best:
+        lines.append("")
+        lines.append("أفضل الإشارات:")
+        for t in best:
+            lines.append(f"• {t['symbol']} +{t['target_pct']}% في {t['hours_to_close']}س")
+    return "\n".join(lines)
+
+
+def report_due():
+    if not TRACK["last_report"]:
+        return False
+    last = datetime.fromisoformat(TRACK["last_report"])
+    return (datetime.now(timezone.utc) - last).days >= REPORT_DAYS
 
 
 def reject(reason):
@@ -118,7 +274,17 @@ def clamp(v, lo, hi):
 def timeframe_of(target_pct, atr_pct, bar_hours):
     if atr_pct <= 0:
         return "خلال 24 ساعة"
-    hours = max(1.0, (target_pct / atr_pct) * 1.6 * bar_hours)
+    hours = max(0.15, (target_pct / atr_pct) * 1.6 * bar_hours)
+    if hours <= 0.35:
+        return "خلال 10 - 20 دقيقة"
+    if hours <= 0.6:
+        return "خلال 20 - 40 دقيقة"
+    if hours <= 1:
+        return "خلال 40 - 60 دقيقة"
+    if hours <= 2:
+        return "خلال 1 - 2 ساعة"
+    if hours <= 4:
+        return "خلال 2 - 4 ساعات"
     if hours <= 8:
         return "خلال 4 - 8 ساعات"
     if hours <= 24:
@@ -487,6 +653,13 @@ def scan_nasdaq():
 # =============================================================
 #  الرسالة
 # =============================================================
+def to_html_msg(text):
+    out = html.escape(text, quote=False)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out, flags=re.S)
+    out = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", out, flags=re.S)
+    return out
+
+
 def build_message(sig):
     f = sig.fmt
     text = ("🚨 **تنبيه إشارة تداول جديدة** 🚨\n\n"
@@ -498,10 +671,7 @@ def build_message(sig):
             f"• **وقف الخسارة:** {f(sig.stop)} (-{sig.stop_pct:.2f}%)\n"
             f"• **معدل دقة الإشارة:** {ACCURACY}\n\n"
             f"_نسبة المخاطرة/العائد: 1:{sig.rr:.2f} — قوة الإشارة: {sig.score:.0f}/100_")
-    out = html.escape(text, quote=False)
-    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out, flags=re.S)
-    out = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", out, flags=re.S)
-    return out
+    return to_html_msg(text)
 
 
 async def health_server():
@@ -527,6 +697,10 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     log.info("Bot started")
     await health_server()
+    track_load()
+    if not TRACK["last_report"]:
+        TRACK["last_report"] = datetime.now(timezone.utc).isoformat()
+        track_save()
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -558,6 +732,7 @@ async def main():
                             disable_web_page_preview=True,
                         )
                         sent_tokens[sig.key] = datetime.now(timezone.utc)
+                        track_add(sig)
                         log.info(f"Signal sent: {sig.key} +{sig.target_pct:.2f}%")
                         await asyncio.sleep(1)
                     except Exception as e:
@@ -572,6 +747,27 @@ async def main():
                 } for s in fresh])
 
                 log.info(f"Scan complete: {len(found)} found, {len(fresh)} sent - waiting {SCAN_MINUTES} min")
+
+                # --- تتبع نتائج الإشارات السابقة ---
+                await track_check(session)
+                log.info(f"Track: {len(TRACK['open'])} مفتوحة | "
+                         f"{len(TRACK['closed'])} مغلقة")
+
+                # --- التقرير الأسبوعي ---
+                if report_due():
+                    try:
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=to_html_msg(weekly_report_text()),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                        TRACK["last_report"] = datetime.now(timezone.utc).isoformat()
+                        track_save()
+                        log.info("Weekly report sent")
+                    except Exception as e:
+                        log.error(f"weekly report failed: {e}")
+
                 await asyncio.sleep(SCAN_MINUTES * 60)
 
             except Exception as e:
