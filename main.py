@@ -22,7 +22,7 @@ sent_tokens = {}
 SCAN_MINUTES = 15
 COOLDOWN_HOURS = 4
 MAX_SIGNALS = 5
-STATUS_HOURS = 6          # رسالة حالة دورية للقناة (0 = تعطيل)
+STATUS_HOURS = 0          # رسالة حالة دورية للقناة (0 = معطّلة)
 
 # --- وضع الصفقات الصغيرة عالية الدقة ---
 MIN_TARGET_PCT = 1.5      # هدف صغير = احتمال إصابة أعلى
