@@ -22,6 +22,7 @@ sent_tokens = {}
 SCAN_MINUTES = 15
 COOLDOWN_HOURS = 4
 MAX_SIGNALS = 5
+STATUS_HOURS = 6          # رسالة حالة دورية للقناة (0 = تعطيل)
 
 # --- وضع الصفقات الصغيرة عالية الدقة ---
 MIN_TARGET_PCT = 1.5      # هدف صغير = احتمال إصابة أعلى
@@ -702,6 +703,28 @@ async def main():
         TRACK["last_report"] = datetime.now(timezone.utc).isoformat()
         track_save()
 
+    # --- رسالة ترحيب للتأكد من الربط بالقناة ---
+    try:
+        me = await bot.get_me()
+        welcome = (
+            "✅ **تم تشغيل بوت الإشارات بنجاح**\n\n"
+            f"• البوت: @{me.username}\n"
+            f"• الفحص: كل {SCAN_MINUTES} دقيقة\n"
+            f"• الحد الأدنى للهدف: +{MIN_TARGET_PCT}%\n"
+            f"• أقصى عدد إشارات للفحص: {MAX_SIGNALS}\n"
+            f"• التبريد لكل عملة: {COOLDOWN_HOURS} ساعات\n"
+            f"• تقرير النتائج: كل {REPORT_DAYS} أيام\n\n"
+            "_الربط بالقناة يعمل. سيصلك التنبيه فور توفر إشارة مطابقة._"
+        )
+        await bot.send_message(chat_id=CHANNEL_ID, text=to_html_msg(welcome),
+                               parse_mode=ParseMode.HTML)
+        log.info(f"Welcome message sent to {CHANNEL_ID} as @{me.username}")
+    except Exception as e:
+        log.error(f"WELCOME FAILED -> {type(e).__name__}: {e}")
+        log.error("تحقق من: صحة التوكن | معرّف القناة | كون البوت مشرفاً بصلاحية النشر")
+
+    last_status = datetime.now(timezone.utc)
+
     async with aiohttp.ClientSession() as session:
         while True:
             try:
@@ -767,6 +790,28 @@ async def main():
                         log.info("Weekly report sent")
                     except Exception as e:
                         log.error(f"weekly report failed: {e}")
+
+                # --- رسالة حالة دورية توضح سبب عدم وجود إشارات ---
+                if STATUS_HOURS and (datetime.now(timezone.utc) - last_status
+                                     >= timedelta(hours=STATUS_HOURS)):
+                    try:
+                        top = sorted(REJECTS.items(), key=lambda x: -x[1])[:4]
+                        reasons = "\n".join(f"  • {k}: {v}" for k, v in top) or "  • لا يوجد"
+                        status = (
+                            "📡 **حالة البوت**\n\n"
+                            f"• آخر فحص: {len(REJECTS) and sum(REJECTS.values())} عملة مفحوصة\n"
+                            f"• إشارات مرسلة (إجمالي): {len(TRACK['open']) + len(TRACK['closed'])}\n"
+                            f"• صفقات مفتوحة الآن: {len(TRACK['open'])}\n\n"
+                            "أسباب استبعاد العملات:\n" + reasons + "\n\n"
+                            "_البوت يعمل. لا توجد إشارات مطابقة للشروط حالياً._"
+                        )
+                        await bot.send_message(chat_id=CHANNEL_ID,
+                                               text=to_html_msg(status),
+                                               parse_mode=ParseMode.HTML)
+                        last_status = datetime.now(timezone.utc)
+                        log.info("Status message sent")
+                    except Exception as e:
+                        log.error(f"status failed: {e}")
 
                 await asyncio.sleep(SCAN_MINUTES * 60)
 
